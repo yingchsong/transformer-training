@@ -35,7 +35,7 @@ class EncoderDecoder(nn.Module):
         self.tmp = self.encoder(src,src_mask)
         return self.decoder(self.tmp, src_mask, tgt, tgt_mask)
 
-    def encoder(self,src,src_mask):
+    def encode(self,src,src_mask):
         """
             对源序列进行编码，生成源序列的语义记忆（memory）
             核心逻辑：源序列token → 词嵌入向量 → 编码器编码（结合掩码）
@@ -115,7 +115,18 @@ class SublayerConnection(nn.Module):
         # 4. x + ...：残差连接（原始输入 + 子层处理后的输出）
         return x + self.dropout(sublayer(self.norm(x)))
 
+# Feedward network
+class PositionwiseFeedForward(nn.Module):
+    "Implements FFN equation."
 
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(self.w_1(x).relu()))
 
 # Encoder parts
 class Encoder(nn.Module):
@@ -241,9 +252,133 @@ class MultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1)
 
         nbatches = query.size(0)  # 获取批次大小（batch_size）
-
+        # 1) Do all the linear projections in batch from d_model => h x d_k
+        #线性投影+维度转化
         query, key, value = [
             lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
             for lin, x in zip(self.linears, (query, key, value))
+            #zip迭代器匹配，将输入的两个元素进行匹配，第二个元素有三个(query, key, value)
+            #(self.linears[0], query)
+            #(self.linears[1], key)
+            #(self.linears[2], value)
         ]
 
+        # 2) Apply attention on all the projected vectors in batch.
+        x, self.attn = attention(
+            query, key, value, mask=mask, dropout=self.dropout
+        )
+
+        # 3) "Concat" using a view and apply a final linear.
+        x = (
+            x.transpose(1, 2)           # 交换维度1和2 → [batch, seq_len, h, d_k]
+            .contiguous()                           # 整理内存（避免view失败）
+            .view(nbatches, -1, self.h * self.d_k)  # 拼接h个头 → [batch, seq_len, h×d_k=d_model]
+        )
+
+        del query
+        del key
+        del value
+        # 最终线性投影（W^O）：将拼接后的结果投影回d_model维度，返回最终输出
+        return self.linears[-1](x)
+
+# Embedding parts
+
+class Embeddings(nn.Module):
+    def __init__(self,d_model, vocab):
+        super(Embeddings,self).__init__()
+        # - vocab：词汇表大小（比如中文词汇表有10000个词）
+        # - d_model：嵌入向量维度（论文中512）
+        # - 输出：将词索引映射为d_model维的连续向量（可学习参数）
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model # 保存嵌入维度，用于后续缩放
+
+    def forward(self,x):
+        # 步骤1：self.lut(x) → 将词索引x映射为嵌入向量，形状 [batch, seq_len, d_model]
+        # 步骤2：* math.sqrt(self.d_model) → 对嵌入向量做缩放（论文关键设计）
+        return self.lut(x) * math.sqrt(self.d_model)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout, max_len=5000):
+        super(PositionalEncoding,self).__init__()
+
+        self.dropout = nn.Dropout(p=dropout)
+        # 步骤1：初始化位置编码矩阵pe，形状[max_len, d_model]（max_len=5000表示支持最长5000个token的序列）
+        pe = torch.zeros(max_len, d_model)
+        # 步骤2：生成位置索引pos，形状[max_len, 1]（从0到4999的位置）
+        # unsqueeze(1)：将[max_len]转为[max_len,1]，方便后续和div_term做广播乘法
+        position = torch.arange(0, max_len).unsqueeze(1)
+        # 步骤3：计算分母项div_term（对应公式中的10000^(2i/d_model)，用对数+指数转换避免数值溢出）
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
+        )
+        # 步骤4：填充正弦/余弦值到pe矩阵（对应论文公式）
+        # pe[:, 0::2]：所有行，从0开始、步长2的列（偶数维度）→ 填充sin值
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # pe[:, 1::2]：所有行，从1开始、步长2的列（奇数维度）→ 填充cos值
+        pe[:, 1::2] = torch.cos(position * div_term)
+        # 步骤5：扩展batch维度，形状[max_len, d_model] → [1, max_len, d_model]
+        # 目的：支持广播（后续和[batch, seq_len, d_model]的词嵌入相加）
+        pe = pe.unsqueeze(0)
+        # 步骤6：将pe注册为缓冲区（buffer）
+        # 含义：pe是不参与梯度更新的参数（位置编码固定，无需学习），但会随模型保存/加载
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        # x：输入的词嵌入向量，形状[batch, seq_len, d_model]
+        # self.pe[:, :x.size(1)]：截取前x.size(1)个位置的编码（适配当前序列长度），形状[1, seq_len, d_model]
+        # requires_grad_(False)：明确指定不计算梯度（双重保障）
+        x = x + self.pe[:, : x.size(1)].requires_grad_(False)
+        return self.dropout(x)
+
+def make_model(
+    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
+):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        Generator(d_model, tgt_vocab),
+    )
+
+    # This was important from their code.
+    # Initialize parameters with Glorot / fan_avg.
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+    return model
+
+
+def inference_test():
+    test_model = make_model(11, 11, 2)
+    test_model.eval()
+    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    src_mask = torch.ones(1, 1, 10)
+
+    memory = test_model.encode(src, src_mask)
+    ys = torch.zeros(1, 1).type_as(src)
+
+    for i in range(9):
+        out = test_model.decode(
+            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
+        )
+        prob = test_model.generator(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.data[0]
+        ys = torch.cat(
+            [ys, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1
+        )
+
+    print("Example Untrained Model Prediction:", ys)
+
+
+def run_tests():
+    for _ in range(10):
+        inference_test()
+
+run_tests()
