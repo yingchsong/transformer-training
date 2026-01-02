@@ -21,64 +21,7 @@ def subsequent_mask(size):
     # 步骤3：反转掩码（上三角1→0，对角线及下三角0→1），最终得到“允许关注”的位置
     return subsequent_mask == 0
 
-class EncoderDecoder(nn.Module):
-    def __init__(self,encoder,decoder,src_embed, tgt_embed, generator):
-        super(EncoderDecoder,self).__init__()
-        self.encoder = encoder  # 编码器模块
-        self.decoder = decoder  # 解码器模块
-        self.src_embed = src_embed  # 源语言嵌入层（将源词转为向量）
-        self.tgt_embed = tgt_embed  # 目标语言嵌入层（将目标词转为向量）
-        self.generator = generator  # 生成器模块（输出词表概率）
 
-    def forward(self,src, tgt, src_mask, tgt_mask):
-
-        self.tmp = self.encoder(src,src_mask)
-        return self.decoder(self.tmp, src_mask, tgt, tgt_mask)
-
-    def encode(self,src,src_mask):
-        """
-            对源序列进行编码，生成源序列的语义记忆（memory）
-            核心逻辑：源序列token → 词嵌入向量 → 编码器编码（结合掩码）
-
-            Args:
-                src (torch.Tensor): 源序列token张量，形状一般为 [batch_size, src_seq_len]
-                src_mask (torch.Tensor): 源序列掩码张量，用于遮挡padding部分，形状 [batch_size, 1, src_seq_len]
-
-            Returns:
-                torch.Tensor: 编码器输出的语义记忆（memory），形状 [batch_size, src_seq_len, d_model]
-                              包含源序列的全部语义信息，供解码器使用
-        """
-        return self.encoder(self.src_embed(src),src_mask)
-
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        """
-            基于编码器的语义记忆对目标序列进行解码，生成目标序列的特征表示
-            核心逻辑：目标序列token → 词嵌入向量 → 解码器解码（结合memory和各类掩码）
-
-            Args:
-                memory (torch.Tensor): 编码器输出的源序列语义记忆，形状 [batch_size, src_seq_len, d_model]
-                src_mask (torch.Tensor): 源序列掩码张量，用于解码器的跨注意力层，避免关注源序列padding
-                tgt (torch.Tensor): 目标序列token张量，形状一般为 [batch_size, tgt_seq_len]
-                tgt_mask (torch.Tensor): 目标序列掩码张量，遮挡padding和未来位置，形状 [batch_size, tgt_seq_len, tgt_seq_len]
-
-            Returns:
-                torch.Tensor: 解码器输出的目标序列特征，形状 [batch_size, tgt_seq_len, d_model]
-                              需传入Generator层才能生成词表概率
-        """
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
-
-class Generator(nn.Module):
-    def __init__(self,d_model,vocab):
-        # d_model：解码器输出特征的维度（论文中为512）
-        # vocab：目标词表的大小（比如翻译任务中目标语言的总词数）
-        super(Generator,self).__init__()
-        # 定义线性投影层：将d_model维特征映射到词表维度
-        self.proj = nn.Linear(d_model, vocab)
-
-    def forward(self,x):
-        # 1. self.proj(x)：线性层将特征从d_model维 → vocab维
-        # 2. log_softmax(..., dim=-1)：对最后一维做log_softmax，将数值转为对数概率
-        return log_softmax(self.proj(x), dim=-1)
 
 # 归一化模块
 class LayerNorm(nn.Module):
@@ -282,7 +225,6 @@ class MultiHeadedAttention(nn.Module):
         return self.linears[-1](x)
 
 # Embedding parts
-
 class Embeddings(nn.Module):
     def __init__(self,d_model, vocab):
         super(Embeddings,self).__init__()
@@ -330,55 +272,63 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
         return self.dropout(x)
 
-def make_model(
-    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
-):
-    "Helper: Construct a model from hyperparameters."
-    c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
-    model = EncoderDecoder(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
-        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
-        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-        Generator(d_model, tgt_vocab),
-    )
+class Generator(nn.Module):
+    def __init__(self,d_model,vocab):
+        # d_model：解码器输出特征的维度（论文中为512）
+        # vocab：目标词表的大小（比如翻译任务中目标语言的总词数）
+        super(Generator,self).__init__()
+        # 定义线性投影层：将d_model维特征映射到词表维度
+        self.proj = nn.Linear(d_model, vocab)
 
-    # This was important from their code.
-    # Initialize parameters with Glorot / fan_avg.
-    for p in model.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
-    return model
+    def forward(self,x):
+        # 1. self.proj(x)：线性层将特征从d_model维 → vocab维
+        # 2. log_softmax(..., dim=-1)：对最后一维做log_softmax，将数值转为对数概率
+        return log_softmax(self.proj(x), dim=-1)
 
 
-def inference_test():
-    test_model = make_model(11, 11, 2)
-    test_model.eval()
-    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    src_mask = torch.ones(1, 1, 10)
+class EncoderDecoder(nn.Module):
+    def __init__(self,encoder,decoder,src_embed, tgt_embed, generator):
+        super(EncoderDecoder,self).__init__()
+        self.encoder = encoder  # 编码器模块
+        self.decoder = decoder  # 解码器模块
+        self.src_embed = src_embed  # 源语言嵌入层（将源词转为向量）
+        self.tgt_embed = tgt_embed  # 目标语言嵌入层（将目标词转为向量）
+        self.generator = generator  # 生成器模块（输出词表概率）
 
-    memory = test_model.encode(src, src_mask)
-    ys = torch.zeros(1, 1).type_as(src)
+    def forward(self,src, tgt, src_mask, tgt_mask):
 
-    for i in range(9):
-        out = test_model.decode(
-            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
-        )
-        prob = test_model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data[0]
-        ys = torch.cat(
-            [ys, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1
-        )
+        self.memory = self.encoder(src,src_mask)
+        return self.decoder(self.memory, src_mask, tgt, tgt_mask)
 
-    print("Example Untrained Model Prediction:", ys)
+    def encode(self,src,src_mask):
+        """
+            对源序列进行编码，生成源序列的语义记忆（memory）
+            核心逻辑：源序列token → 词嵌入向量 → 编码器编码（结合掩码）
 
+            Args:
+                src (torch.Tensor): 源序列token张量，形状一般为 [batch_size, src_seq_len]
+                src_mask (torch.Tensor): 源序列掩码张量，用于遮挡padding部分，形状 [batch_size, 1, src_seq_len]
 
-def run_tests():
-    for _ in range(10):
-        inference_test()
+            Returns:
+                torch.Tensor: 编码器输出的语义记忆（memory），形状 [batch_size, src_seq_len, d_model]
+                              包含源序列的全部语义信息，供解码器使用
+        """
+        return self.encoder(self.src_embed(src),src_mask)
 
-run_tests()
+    def decode(self, memory, src_mask, tgt, tgt_mask):
+        """
+            基于编码器的语义记忆对目标序列进行解码，生成目标序列的特征表示
+            核心逻辑：目标序列token → 词嵌入向量 → 解码器解码（结合memory和各类掩码）
+
+            Args:
+                memory (torch.Tensor): 编码器输出的源序列语义记忆，形状 [batch_size, src_seq_len, d_model]
+                src_mask (torch.Tensor): 源序列掩码张量，用于解码器的跨注意力层，避免关注源序列padding
+                tgt (torch.Tensor): 目标序列token张量，形状一般为 [batch_size, tgt_seq_len]
+                tgt_mask (torch.Tensor): 目标序列掩码张量，遮挡padding和未来位置，形状 [batch_size, tgt_seq_len, tgt_seq_len]
+
+            Returns:
+                torch.Tensor: 解码器输出的目标序列特征，形状 [batch_size, tgt_seq_len, d_model]
+                              需传入Generator层才能生成词表概率
+        """
+        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+
